@@ -102,7 +102,12 @@ class ParseRule:
 
 @dataclass
 class LogEntry:
-    """单条日志条目——跨模块流转的核心数据载体。"""
+    """单条日志条目——跨模块流转的核心数据载体。
+
+    ``byte_start`` / ``byte_end`` 是该行在来源文件中的原始字节范围，
+    右开区间且包含行尾换行符；断点恢复只按这个范围推进，不按成功行数推进。
+    ``raw_bytes`` 保存包含行尾的原始字节，便于重算校验与幂等键。
+    """
     raw_line: str
     line_number: int
     source_id: str
@@ -111,6 +116,12 @@ class LogEntry:
     event_time: datetime | None = None
     host: str = ""
     checksum: str = field(default="")
+    byte_start: int = 0
+    byte_end: int = 0
+    raw_bytes: bytes = b""
+    entry_key: str = ""
+    terminated: bool = True
+    encoding: str = "utf-8"
 
     def compute_checksum(self) -> str:
         """基于原始行和解析字段计算内容校验哈希。"""
@@ -120,9 +131,56 @@ class LogEntry:
         )
         return hashlib.sha256(raw.encode()).hexdigest()
 
+    def compute_entry_key(self) -> str:
+        """幂等键：同一来源、同一字节位置、同一原始字节只占一次名额。
+
+        没有字节位置的手工条目退回用来源 + 行号 + 原始内容作为键，
+        保证测试里重复提交同一原行也只结算一次。
+        """
+        payload = self.raw_bytes or self.raw_line.encode(self.encoding or "utf-8")
+        if self.byte_end > self.byte_start:
+            position = f"{self.byte_start}:{self.byte_end}"
+        else:
+            position = f"line:{self.line_number}"
+        digest = hashlib.sha256(payload).hexdigest()
+        return f"{self.source_id}|{position}|{digest}"
+
+    def compute_content_key(self) -> str:
+        """原行内容指纹：同一来源重复提交同一原行时用于只记一次名额。
+
+        与 ``entry_key`` 不同，这里不看字节位置，只看来源和原始内容（去掉行尾），
+        因此“断点重放/重复提交”的同一条日志不会被重复结算。
+        """
+        payload = self.raw_bytes
+        if payload:
+            payload = payload.rstrip(b"\r\n")
+        else:
+            payload = self.raw_line.encode(self.encoding or "utf-8")
+        digest = hashlib.sha256(payload).hexdigest()
+        return f"{self.source_id}|{digest}"
+
+    def ensure_positions(self, offset: int, encoding: str | None = None) -> int:
+        """没有字节范围时按原始字节补齐位置，返回该行结束偏移。"""
+        encoding = encoding or self.encoding or "utf-8"
+        if self.byte_end > self.byte_start:
+            return self.byte_end
+        payload = self.raw_bytes
+        if not payload:
+            payload = self.raw_line.encode(encoding)
+            if self.terminated:
+                payload += b"\n"
+        self.raw_bytes = payload
+        self.byte_start = offset
+        self.byte_end = offset + len(payload)
+        if not self.entry_key:
+            self.entry_key = self.compute_entry_key()
+        return self.byte_end
+
     def __post_init__(self):
         if not self.checksum:
             self.checksum = self.compute_checksum()
+        if not self.entry_key:
+            self.entry_key = self.compute_entry_key()
 
 
 @dataclass
@@ -226,6 +284,7 @@ class EventRecord:
     source_host: str
     store_partition: str = ""
     index_state: str = "已写入"
+    entry_key: str = ""
 
 
 @dataclass
@@ -294,6 +353,9 @@ class IngestJob:
     processed_lines: int = 0
     skipped_lines: int = 0
     state: str = "待执行"
+    encoding: str = "utf-8"
+    duplicate_lines: int = 0
+    seen_entry_keys: set[str] = field(default_factory=set)
 
 
 @dataclass

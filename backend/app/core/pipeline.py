@@ -135,30 +135,160 @@ class IngestPipeline:
         self._checkpoint_store: dict[str, BatchCheckpoint] = {}
         self._event_store: dict[str, list[EventRecord]] = {}
         self._fingerprint_seen: set[str] = set()
+        self._classified_keys: set[str] = set()
+        self._stored_entry_keys: set[str] = set()
 
     # ---------- 数据流 1: log_source → parser_rule → ingest_job → event_store ----------
 
-    def parse_raw_lines(self, source: LogSourceConfig, raw_lines: list[str]) -> list[LogEntry]:
-        """用来源配置校验原始日志行格式。"""
+    def parse_raw_lines(
+        self,
+        source: LogSourceConfig,
+        raw_lines: list[str],
+        *,
+        start_offset: int = 0,
+        encoding: str | None = None,
+    ) -> list[LogEntry]:
+        """用来源配置校验原始日志行格式。
+
+        每一行都会带上原始字节范围：``byte_start`` 含头不含尾、``byte_end``
+        包含行尾换行符。空行和格式错行也保留位置，供断点恢复使用；
+        它们不参与采集名额结算，但下一轮必须能从它们之后继续。
+        """
+        encoding = encoding or source.encoding or "utf-8"
         entries: list[LogEntry] = []
+        offset = start_offset
         for i, line in enumerate(raw_lines):
-            if not line.strip():
-                continue
-            if not source.match_format(line):
-                entries.append(LogEntry(
-                    raw_line=line, line_number=i + 1, source_id=source.source_id,
-                    parse_status=ParseResultStatus.FORMAT_MISMATCH,
-                ))
-                continue
-            entries.append(LogEntry(
-                raw_line=line, line_number=i + 1, source_id=source.source_id,
-            ))
+            text = line
+            payload = text.encode(encoding)
+            terminated = True
+            if payload.endswith(b"\n"):
+                # 调用方已经带上了行尾，原样保留字节范围。
+                content_bytes = payload[:-1]
+                if content_bytes.endswith(b"\r"):
+                    content_bytes = content_bytes[:-1]
+            else:
+                payload += b"\n"
+                content_bytes = payload[:-1]
+            try:
+                text = content_bytes.decode(encoding)
+                decode_error = False
+            except UnicodeDecodeError:
+                text = content_bytes.decode(encoding, errors="replace")
+                decode_error = True
+            byte_start = offset
+            byte_end = offset + len(payload)
+            offset = byte_end
+            if decode_error:
+                status = ParseResultStatus.ENCODING_ERROR
+            elif not text.strip():
+                status = ParseResultStatus.LINE_EMPTY
+            elif not source.match_format(text):
+                status = ParseResultStatus.FORMAT_MISMATCH
+            else:
+                status = ParseResultStatus.OK
+            entry = LogEntry(
+                raw_line=text,
+                line_number=i + 1,
+                source_id=source.source_id,
+                parse_status=status,
+                byte_start=byte_start,
+                byte_end=byte_end,
+                raw_bytes=payload,
+                terminated=terminated,
+                encoding=encoding,
+            )
+            entries.append(entry)
         return entries
+
+    # ---------- 按字节读取来源文件（含行尾、编码安全） ----------
+
+    def read_source_lines(
+        self,
+        source: LogSourceConfig,
+        data: bytes,
+        *,
+        start: int = 0,
+        encoding: str | None = None,
+        rule: ParseRule | None = None,
+        include_partial: bool = True,
+    ) -> list[LogEntry]:
+        """从来源原始字节的 ``start`` 位置逐行读取。
+
+        - 行边界按 ``\\n`` 切分，字节范围包含行尾；``\\r\\n`` 也完整计入。
+        - 使用来源的真实编码逐行解码，绝不从半个多字符处开始。
+        - 若 ``start`` 落在行中间，会回退到最近的换行之后重新读取（重复行由
+          ``entry_key`` 幂等去重），避免半个字符/半行。
+        - 文件末尾没有换行的残行默认标记为未终结并保留；协调器会等下一批
+          字节到达后再确认它。
+        """
+        encoding = encoding or source.encoding or "utf-8"
+        if start < 0 or start > len(data):
+            raise ValueError(f"读取位置越界：{start}")
+        if start > 0 and data[start - 1:start] != b"\n":
+            previous_newline = data.rfind(b"\n", 0, start)
+            start = previous_newline + 1 if previous_newline >= 0 else 0
+        line_number = data.count(b"\n", 0, start) + 1
+        entries: list[LogEntry] = []
+        position = start
+        while position < len(data):
+            newline = data.find(b"\n", position)
+            if newline < 0:
+                if not include_partial:
+                    break
+                byte_end = len(data)
+                payload = data[position:byte_end]
+                content_bytes = payload
+                terminated = False
+            else:
+                byte_end = newline + 1
+                payload = data[position:byte_end]
+                content_bytes = data[position:newline]
+                terminated = True
+            if content_bytes.endswith(b"\r"):
+                content_bytes = content_bytes[:-1]
+            try:
+                text = content_bytes.decode(encoding)
+                decode_error = False
+            except UnicodeDecodeError:
+                text = content_bytes.decode(encoding, errors="replace")
+                decode_error = True
+            if decode_error:
+                status = ParseResultStatus.ENCODING_ERROR
+            elif not text.strip():
+                status = ParseResultStatus.LINE_EMPTY
+            elif not source.match_format(text):
+                status = ParseResultStatus.FORMAT_MISMATCH
+            else:
+                status = ParseResultStatus.OK
+            entry = LogEntry(
+                raw_line=text,
+                line_number=line_number,
+                source_id=source.source_id,
+                parse_status=status,
+                byte_start=position,
+                byte_end=byte_end,
+                raw_bytes=payload,
+                terminated=terminated,
+                encoding=encoding,
+            )
+            if rule is not None and status == ParseResultStatus.OK:
+                parsed_status, fields = rule.parse(text)
+                entry.parse_status = parsed_status
+                entry.parsed_fields = fields or {}
+                entry.checksum = entry.compute_checksum()
+            entries.append(entry)
+            position = byte_end
+            line_number += 1
+        return entries
+
+    def read_source_batch(self, source: LogSourceConfig, data: bytes, **kwargs: Any) -> list[LogEntry]:
+        """``read_source_lines`` 的别名，便于按批次读取来源日志。"""
+        return self.read_source_lines(source, data, **kwargs)
 
     def apply_parse_rules(self, entries: list[LogEntry], rule: ParseRule) -> list[LogEntry]:
         """用解析规则从日志条目中提取字段。"""
         for entry in entries:
-            if entry.parse_status == ParseResultStatus.FORMAT_MISMATCH:
+            if entry.parse_status != ParseResultStatus.OK:
                 continue
             status, fields = rule.parse(entry.raw_line)
             entry.parse_status = status
@@ -166,38 +296,70 @@ class IngestPipeline:
             entry.checksum = entry.compute_checksum()
         return entries
 
-    def run_ingest_job(self, entries: list[LogEntry], job: IngestJob) -> list[LogEntry]:
-        """执行采集作业：按 batch_size 分批，追踪文件游标和跳过行数。"""
+    def run_ingest_job(
+        self,
+        entries: list[LogEntry],
+        job: IngestJob,
+        *,
+        enforce_batch_size: bool = True,
+    ) -> list[LogEntry]:
+        """执行采集作业：按 batch_size 分批，追踪文件游标和跳过行数。
+
+        只有合格原行（``ParseResultStatus.OK``）消耗采集名额；空行、格式错行、
+        编码错行只登记跳过，但仍然推进到包含行尾的字节位置。游标始终指向
+        “第一条未确认的原始字节”，不会因为按成功行数累加而越过错误行。
+        """
         processed: list[LogEntry] = []
+        seen = job.seen_entry_keys
         for entry in entries:
-            if job.processed_lines >= job.batch_size:
+            key = entry.entry_key or entry.compute_entry_key()
+            # 没有字节位置的条目（手工构造/测试数据）按当前游标补齐。
+            if entry.byte_end <= entry.byte_start:
+                entry.ensure_positions(job.file_cursor, job.encoding)
+                key = entry.entry_key or key
+            if key in seen:
+                # 已确认过的原行不重复占名额，但恢复位置仍需越过它。
+                job.duplicate_lines += 1
+                job.file_cursor = max(job.file_cursor, entry.byte_end)
+                continue
+            qualified = entry.parse_status == ParseResultStatus.OK
+            if qualified and enforce_batch_size and job.processed_lines >= job.batch_size:
+                # 停在第一条未确认的合格原行开头，下一轮从这里继续读。
                 break
-            if entry.parse_status == ParseResultStatus.FORMAT_MISMATCH:
+            if not qualified:
                 job.skipped_lines += 1
+                job.file_cursor = max(job.file_cursor, entry.byte_end)
+                seen.add(key)
                 processed.append(entry)
                 continue
             job.processed_lines += 1
-            job.file_cursor += len(entry.raw_line.encode(job.source_id and "utf-8" or "utf-8"))
+            job.file_cursor = max(job.file_cursor, entry.byte_end)
+            seen.add(key)
             processed.append(entry)
         return processed
 
-    def classify_events(self, entries: list[LogEntry]) -> list[EventRecord]:
+    def classify_events(self, entries: list[LogEntry], *, dedupe: bool = True) -> list[EventRecord]:
         """将解析后的日志条目按事件类型分类并生成 EventRecord。
 
         数据流入口：event_store ← 解析后的 LogEntry
         分类依据：日志级别（app log → error/access）或来源标识
+        ``entry_key`` 保证重复提交同一条原行只生成一条库存事件。
         """
         records: list[EventRecord] = []
-        host_counter: dict[str, int] = {}
         for entry in entries:
             if entry.parse_status != ParseResultStatus.OK or not entry.parsed_fields:
                 continue
+            key = entry.entry_key or entry.compute_entry_key()
+            if dedupe and key in self._classified_keys:
+                continue
             event_type = self._classify_entry(entry)
             host = entry.parsed_fields.get("client_ip") or entry.parsed_fields.get("hostname") or "unknown"
-            host_counter[host] = host_counter.get(host, 0) + 1
             partition = f"{datetime.now():%Y%m%d}"
+            digest = hashlib.sha1(
+                f"{entry.source_id}|{key}".encode()
+            ).hexdigest()[:12].upper()
             record = EventRecord(
-                record_id=f"EVEN-{host_counter[host]:06d}",
+                record_id=f"EVEN-{digest}",
                 event_type=event_type,
                 original_content=entry.raw_line[:500],
                 parsed_fields=dict(entry.parsed_fields),
@@ -207,15 +369,27 @@ class IngestPipeline:
                 source_host=host,
                 store_partition=partition,
                 index_state="已写入",
+                entry_key=key,
             )
+            if dedupe:
+                self._classified_keys.add(key)
             records.append(record)
         return records
 
     def store_events(self, records: list[EventRecord]) -> int:
-        """写入 event_store 并返回存储条数。"""
+        """写入 event_store 并返回存储条数。
+
+        同一 ``entry_key`` 重复入库只保留一条事件记录。
+        """
+        stored = 0
         for record in records:
+            key = record.entry_key or record.record_id
+            if key in self._stored_entry_keys:
+                continue
+            self._stored_entry_keys.add(key)
             self._event_store.setdefault(record.source_host, []).append(record)
-        return len(records)
+            stored += 1
+        return stored
 
     # ---------- 数据流 2: ingest_job → batch_checkpoint（断点恢复） ----------
 

@@ -81,5 +81,37 @@ npm run dev
 - 列表接口统一返回 `{ items, total, page, size }`，动作接口统一返回 `{ ok, message }`。
 - 状态流转只允许在 `app/services` 里改，路由层不做业务判断。
 
+## 跨来源共享额度采集
+
+`backend/app/core/shared_quota.py` 实现采集额度的跨来源协调，入口类
+`CrossSourceQuotaCollector`（工厂 `make_shared_quota_collector`）。
+
+- **名额**：每轮总 3 个名额，每个来源 1 个基础名额，其余为共享名额。某来源当前
+  批次没有合格原行时，它的基础名额可借给另一来源；借用方多出的候选逐条结算。
+- **位置**：每条日志都带 `byte_start` / `byte_end`，右开区间、包含行尾换行符，
+  按来源真实编码计算。空行、格式错行、编码错行不占名额，但会登记来源与行号，
+  并推进可恢复游标；下一轮从第一条未确认的原始字节继续，不会从半个字符开读。
+- **入账**：采集确认结果驱动入账清单（`ledger()`），分类后的有效事件批次经
+  `run_ingest_job → classify_events → store_events` 写入库存，来源游标与库存
+  原行可由 `reconcile()` 对账。
+- **幂等**：同一来源同一字节范围的同一原行重复提交，只记一次名额、只入一次库存；
+  错行也只登记一次。
+- **借用冲突**（`BorrowPolicy`）：
+  - `borrow_on_claim`：借用一经领用立即生效，迟到来源顺延下一轮；
+  - `reserve_until_submit`：提交前保留来源保底额度，收回借用，迟到来源先写。
+- **断点恢复**：入库成功但回传确认失败时，认领停在“已入库待确认”，
+  `resume_pending()` / `retry_confirmation()` 只重试确认，不重复入库。
+
+接口（挂在通用资源路由之前）：
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| GET | `/api/ingest_job/shared-quota` | 额度、入账清单、错行与对账快照 |
+| POST | `/api/ingest_job/sources` | 登记来源（`source_key`、`order`） |
+| POST | `/api/ingest_job/feed` | 投递来源原始日志内容 |
+| POST | `/api/ingest_job/collect` | 按来源顺序结算若干轮并写入库存 |
+
+前端 `frontend/src/domain/shared_quota.ts` 提供同一口径的静态名额预览与借用冲突裁决。
+
 领域：数据工程
 子方向：数据采集、爬虫与RPA
